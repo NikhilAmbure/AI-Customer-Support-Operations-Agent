@@ -1,60 +1,56 @@
-from dotenv import load_dotenv
-from langchain.chat_models import init_chat_model
+import sqlite3
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import Command
 from langgraph.graph import StateGraph, START, END
 from state import State, TriageResult
+from agents import billing_agent, technical_agent, general_agent
+from llm import llm
 
-load_dotenv()
-
-import os 
-os.environ["GEMINI_API_KEY"] = os.getenv("GEMINI_API_KEY")
-
-llm = init_chat_model(
-    model="gemini-2.5-flash",
-    model_provider="google-genai"
-) 
 
 triage_llm = llm.with_structured_output(TriageResult)
 
 def triage(state: State):
-    result = triage_llm.invoke(
-        f"Classify this customer support ticket.\nTicket: {state['ticket']}"
-    )
+    ticket = state["messages"][-1].content
+    result = triage_llm.invoke(f"Classify this customer support ticket.\nTicket: {ticket}")
     return {"category": result.category}
 
 def route(state: State) -> str:
-    return state["category"]            
+    return state["category"]       
+     
 
-# stubs for now; real agents come in the next step
-def billing(state: State):
-     return {"reply": "[billing agent stub]"}
+graph = StateGraph(State)
 
-def technical(state: State):
-    return {"reply": "[technical agent stub]"}
+graph.add_node("triage", triage)
+graph.add_node("billing", billing_agent)
+graph.add_node("technical", technical_agent)
+graph.add_node("general", general_agent)
 
-def general(state: State): 
-    return {"reply": "[general agent stub]"}
 
-g = StateGraph(State)
-g.add_node("triage", triage)
-g.add_node("billing", billing)
-g.add_node("technical", technical)
-g.add_node("general", general)
-
-g.add_edge(START, "triage")
-g.add_conditional_edges(
+graph.add_edge(START, "triage")
+graph.add_conditional_edges(
     "triage", route,
     {"billing": "billing", "technical": "technical", "general": "general"},
 )
+
 for name in ("billing", "technical", "general"):
-    g.add_edge(name, END)
+    graph.add_edge(name, END)
 
-app = g.compile()
+checkpointer = SqliteSaver(sqlite3.connect("checkpoints.db", check_same_thread=False))
+app = graph.compile(checkpointer=checkpointer)
 
+
+# test
+# ---- delete checkpoints.db, or use a new thread_id, before rerunning.----
 if __name__ == "__main__":
-    tickets = [
-        "I was charged twice for order A100",
-        "The app crashes when I upload a PDF",
-    ]
-    for t in tickets:
-        out = app.invoke({"ticket": t})
-        print(t, "->", out["category"], "|", out["reply"])
+    config = {"configurable": {"thread_id": "t4"}}
+    # out = app.invoke({"messages": [("user", "Please refund order A101")]}, config)
+    out = app.invoke({"messages": [("user", "Where is my invoice for A102?")]}, config)
+
+    if "__interrupt__" in out:
+        print(out["__interrupt__"])          # shows the pending issue_refund call
+        ok = input("approve? y/n ").strip().lower() == "y"
+        decision = {"type": "approve"} if ok else {"type": "reject", "message": "Refund declined."}
+        out = app.invoke(Command(resume={"decisions": [decision]}), config)
+
+    for m in out["messages"]:
+        m.pretty_print()
